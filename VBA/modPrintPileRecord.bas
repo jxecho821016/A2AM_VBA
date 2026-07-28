@@ -5,35 +5,104 @@ Option Explicit
 ' Assign PrintPileRecord to a button (put the button on Record_Template
 ' before creating copies and every generated pile record sheet carries
 ' it). Clicking it exports the active record sheet's print area
-' (A1:B57 on the template) as a JPG:
+' (A1:B57 on the template) as a single JPG image:
 '   1. A folder picker asks where to save.
 '   2. The file is named <Pile ID>_Pile_Record.jpg, e.g.
 '      P-1_Pile_Record.jpg. The pile ID comes from B8, falling back to
 '      the sheet name if B8 is empty.
 '   3. An existing file with that name prompts before overwriting.
 '
-' The export copies the range as a BITMAP (an exact snapshot of the
-' filled-in cells - metafile copies render blank on export in several
-' Excel builds), pastes it into a temporary chart parked in the visible
-' window area so Excel actually draws it, exports the chart as JPG,
-' then deletes it.
+' How it works: the range is copied as a bitmap (a pixel-exact snapshot
+' of the filled-in cells) and written straight from the clipboard to a
+' JPG via the Windows GDI+ API. Earlier chart-paste-export versions
+' produced blank images on some Excel builds; this route has no
+' rendering step and saves exactly what was copied.
 
 Private Const RECORD_TITLE As String = "TIP Testing Site Record Sheet"
 Private Const FILE_SUFFIX As String = "_Pile_Record.jpg"
 
+Private Const CF_BITMAP As Long = 2
+Private Const JPEG_ENCODER_CLSID As String = _
+    "{557CF401-1A04-11D3-9A73-0000F81EF32E}"
+
+Private Type GUID
+    Data1 As Long
+    Data2 As Integer
+    Data3 As Integer
+    Data4(0 To 7) As Byte
+End Type
+
+#If VBA7 Then
+    Private Type GdiplusStartupInput
+        GdiplusVersion As Long
+        DebugEventCallback As LongPtr
+        SuppressBackgroundThread As Long
+        SuppressExternalCodecs As Long
+    End Type
+
+    Private Declare PtrSafe Function OpenClipboard Lib "user32" _
+        (ByVal hwnd As LongPtr) As Long
+    Private Declare PtrSafe Function CloseClipboard Lib "user32" () As Long
+    Private Declare PtrSafe Function GetClipboardData Lib "user32" _
+        (ByVal wFormat As Long) As LongPtr
+    Private Declare PtrSafe Function IsClipboardFormatAvailable Lib "user32" _
+        (ByVal wFormat As Long) As Long
+    Private Declare PtrSafe Function GdiplusStartup Lib "gdiplus" _
+        (token As LongPtr, inputBuf As GdiplusStartupInput, _
+         Optional ByVal outputBuf As LongPtr = 0) As Long
+    Private Declare PtrSafe Sub GdiplusShutdown Lib "gdiplus" _
+        (ByVal token As LongPtr)
+    Private Declare PtrSafe Function GdipCreateBitmapFromHBITMAP Lib "gdiplus" _
+        (ByVal hbm As LongPtr, ByVal hPal As LongPtr, _
+         bitmap As LongPtr) As Long
+    Private Declare PtrSafe Function GdipDisposeImage Lib "gdiplus" _
+        (ByVal image As LongPtr) As Long
+    Private Declare PtrSafe Function GdipSaveImageToFile Lib "gdiplus" _
+        (ByVal image As LongPtr, ByVal fileName As LongPtr, _
+         clsidEncoder As GUID, ByVal encoderParams As LongPtr) As Long
+    Private Declare PtrSafe Function CLSIDFromString Lib "ole32" _
+        (ByVal lpszProgID As LongPtr, pclsid As GUID) As Long
+#Else
+    Private Type GdiplusStartupInput
+        GdiplusVersion As Long
+        DebugEventCallback As Long
+        SuppressBackgroundThread As Long
+        SuppressExternalCodecs As Long
+    End Type
+
+    Private Declare Function OpenClipboard Lib "user32" _
+        (ByVal hwnd As Long) As Long
+    Private Declare Function CloseClipboard Lib "user32" () As Long
+    Private Declare Function GetClipboardData Lib "user32" _
+        (ByVal wFormat As Long) As Long
+    Private Declare Function IsClipboardFormatAvailable Lib "user32" _
+        (ByVal wFormat As Long) As Long
+    Private Declare Function GdiplusStartup Lib "gdiplus" _
+        (token As Long, inputBuf As GdiplusStartupInput, _
+         Optional ByVal outputBuf As Long = 0) As Long
+    Private Declare Sub GdiplusShutdown Lib "gdiplus" _
+        (ByVal token As Long)
+    Private Declare Function GdipCreateBitmapFromHBITMAP Lib "gdiplus" _
+        (ByVal hbm As Long, ByVal hPal As Long, bitmap As Long) As Long
+    Private Declare Function GdipDisposeImage Lib "gdiplus" _
+        (ByVal image As Long) As Long
+    Private Declare Function GdipSaveImageToFile Lib "gdiplus" _
+        (ByVal image As Long, ByVal fileName As Long, _
+         clsidEncoder As GUID, ByVal encoderParams As Long) As Long
+    Private Declare Function CLSIDFromString Lib "ole32" _
+        (ByVal lpszProgID As Long, pclsid As GUID) As Long
+#End If
+
 Public Sub PrintPileRecord()
     Dim recordSheet As Worksheet
     Dim exportRange As Range
-    Dim chartObj As ChartObject
     Dim pileId As String
     Dim folderPath As String
     Dim filePath As String
-    Dim previousScreenUpdating As Boolean
     Dim errorMessage As String
 
     On Error GoTo CleanFail
 
-    previousScreenUpdating = Application.ScreenUpdating
     Set recordSheet = ActiveSheet
 
     ' Only run on a pile record sheet (a copy of Record_Template).
@@ -79,68 +148,96 @@ Public Sub PrintPileRecord()
     On Error GoTo CleanFail
     If exportRange Is Nothing Then Set exportRange = recordSheet.UsedRange
 
-    ' Screen updating stays ON here: the chart must genuinely render
-    ' on screen, otherwise Excel exports it blank or skips the paste.
-    Application.ScreenUpdating = True
-    recordSheet.Activate
-
-    ' Temporary chart sized exactly to the range, parked at the top of
-    ' the visible window so Excel draws it before the export.
-    Set chartObj = recordSheet.ChartObjects.Add( _
-        Left:=ActiveWindow.VisibleRange.Left, _
-        Top:=ActiveWindow.VisibleRange.Top, _
-        Width:=exportRange.Width, _
-        Height:=exportRange.Height)
-    chartObj.Chart.ChartArea.Format.Line.Visible = msoFalse
-    chartObj.Activate
-
-    ' Bitmap copy = pixel-exact snapshot of the filled-in cells. The
-    ' metafile (xlPicture) alternative exports blank in several Excel
-    ' builds, so it is only the fallback.
+    ' Snapshot the whole range (all of it, in one image - no paging)
+    ' onto the clipboard, then write the clipboard bitmap to the JPG.
     exportRange.CopyPicture Appearance:=xlScreen, Format:=xlBitmap
-    chartObj.Chart.Paste
     DoEvents
-    If chartObj.Chart.Shapes.Count = 0 Then
-        exportRange.CopyPicture Appearance:=xlScreen, Format:=xlPicture
-        chartObj.Chart.Paste
+    If IsClipboardFormatAvailable(CF_BITMAP) = 0 Then
+        ' Occasionally the first copy does not land; try once more.
+        exportRange.CopyPicture Appearance:=xlScreen, Format:=xlBitmap
         DoEvents
     End If
-    If chartObj.Chart.Shapes.Count = 0 Then
-        Err.Raise vbObjectError + 513, , _
-            "Excel did not paste the sheet picture into the export " & _
-            "chart. Please try again."
-    End If
 
-    With chartObj.Chart
-        With .Shapes(1)
-            .LockAspectRatio = msoFalse
-            .Left = 0
-            .Top = 0
-            .Width = chartObj.Width
-            .Height = chartObj.Height
-        End With
-        .Refresh
-        DoEvents  ' let the paste render before exporting
-        .Export Filename:=filePath, FilterName:="JPG"
-    End With
+    SaveClipboardBitmapAsJpeg filePath  ' raises a VBA error on failure
 
-    chartObj.Delete
-    Set chartObj = Nothing
     Application.CutCopyMode = False
-    recordSheet.Range("A1").Select  ' drop the chart selection
-    Application.ScreenUpdating = previousScreenUpdating
 
     MsgBox "Saved:" & vbCrLf & filePath, vbInformation, "Print pile record"
     Exit Sub
 
 CleanFail:
     errorMessage = Err.Description
-    On Error Resume Next
-    If Not chartObj Is Nothing Then chartObj.Delete
-    On Error GoTo 0
-    Application.ScreenUpdating = previousScreenUpdating
+    Application.CutCopyMode = False
     MsgBox "Could not save the pile record image." & vbCrLf & vbCrLf & _
            errorMessage, vbExclamation, "Print pile record"
+End Sub
+
+' Writes the bitmap currently on the clipboard to filePath as a JPG
+' using GDI+. Raises a VBA error if any step fails.
+Private Sub SaveClipboardBitmapAsJpeg(ByVal filePath As String)
+    #If VBA7 Then
+        Dim gdiplusToken As LongPtr
+        Dim hBitmap As LongPtr
+        Dim gdipImage As LongPtr
+    #Else
+        Dim gdiplusToken As Long
+        Dim hBitmap As Long
+        Dim gdipImage As Long
+    #End If
+    Dim startupInput As GdiplusStartupInput
+    Dim jpegClsid As GUID
+    Dim clipboardOpen As Boolean
+    Dim gdiplusStarted As Boolean
+    Dim failureText As String
+
+    On Error GoTo CleanFail
+
+    If IsClipboardFormatAvailable(CF_BITMAP) = 0 Then
+        failureText = "No picture found on the clipboard."
+        GoTo CleanFail
+    End If
+
+    If OpenClipboard(0) = 0 Then
+        failureText = "Could not open the Windows clipboard."
+        GoTo CleanFail
+    End If
+    clipboardOpen = True
+
+    hBitmap = GetClipboardData(CF_BITMAP)
+    If hBitmap = 0 Then
+        failureText = "Could not read the picture from the clipboard."
+        GoTo CleanFail
+    End If
+
+    startupInput.GdiplusVersion = 1
+    If GdiplusStartup(gdiplusToken, startupInput) <> 0 Then
+        failureText = "Could not start the Windows imaging system (GDI+)."
+        GoTo CleanFail
+    End If
+    gdiplusStarted = True
+
+    If GdipCreateBitmapFromHBITMAP(hBitmap, 0, gdipImage) <> 0 Then
+        failureText = "Could not convert the clipboard picture."
+        GoTo CleanFail
+    End If
+
+    CLSIDFromString StrPtr(JPEG_ENCODER_CLSID), jpegClsid
+    If GdipSaveImageToFile(gdipImage, StrPtr(filePath), jpegClsid, 0) <> 0 Then
+        failureText = "Could not write the JPG file:" & vbCrLf & filePath
+        GoTo CleanFail
+    End If
+
+    GdipDisposeImage gdipImage
+    GdiplusShutdown gdiplusToken
+    CloseClipboard
+    Exit Sub
+
+CleanFail:
+    If Len(failureText) = 0 Then failureText = Err.Description
+    If gdipImage <> 0 Then GdipDisposeImage gdipImage
+    If gdiplusStarted Then GdiplusShutdown gdiplusToken
+    If clipboardOpen Then CloseClipboard
+    Err.Raise vbObjectError + 514, "SaveClipboardBitmapAsJpeg", failureText
 End Sub
 
 ' Windows filenames reject \ / : * ? " < > |
