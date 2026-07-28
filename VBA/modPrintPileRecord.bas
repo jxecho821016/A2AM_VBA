@@ -12,13 +12,14 @@ Option Explicit
 '      the sheet name if B8 is empty.
 '   3. An existing file with that name prompts before overwriting.
 '
-' The export renders the range into a temporary chart at EXPORT_SCALE
-' times its on-sheet size (larger scale = sharper image), exports the
-' chart as JPG, then deletes it.
+' The export copies the range as a BITMAP (an exact snapshot of the
+' filled-in cells - metafile copies render blank on export in several
+' Excel builds), pastes it into a temporary chart parked in the visible
+' window area so Excel actually draws it, exports the chart as JPG,
+' then deletes it.
 
 Private Const RECORD_TITLE As String = "TIP Testing Site Record Sheet"
 Private Const FILE_SUFFIX As String = "_Pile_Record.jpg"
-Private Const EXPORT_SCALE As Double = 2#
 
 Public Sub PrintPileRecord()
     Dim recordSheet As Worksheet
@@ -78,26 +79,29 @@ Public Sub PrintPileRecord()
     On Error GoTo CleanFail
     If exportRange Is Nothing Then Set exportRange = recordSheet.UsedRange
 
-    ' Screen updating stays ON here: pasting into a chart needs the
-    ' chart genuinely active, and with updating off Excel can skip the
-    ' paste silently, leaving the chart empty ("index out of bounds").
+    ' Screen updating stays ON here: the chart must genuinely render
+    ' on screen, otherwise Excel exports it blank or skips the paste.
     Application.ScreenUpdating = True
+    recordSheet.Activate
 
-    ' Render the range into a temporary chart and export that as JPG.
+    ' Temporary chart sized exactly to the range, parked at the top of
+    ' the visible window so Excel draws it before the export.
     Set chartObj = recordSheet.ChartObjects.Add( _
-        Left:=exportRange.Left, Top:=exportRange.Top, _
-        Width:=exportRange.Width * EXPORT_SCALE, _
-        Height:=exportRange.Height * EXPORT_SCALE)
+        Left:=ActiveWindow.VisibleRange.Left, _
+        Top:=ActiveWindow.VisibleRange.Top, _
+        Width:=exportRange.Width, _
+        Height:=exportRange.Height)
     chartObj.Chart.ChartArea.Format.Line.Visible = msoFalse
     chartObj.Activate
 
-    ' Copy as a scalable metafile and paste; if Excel drops that paste
-    ' (a known quirk), retry with a plain bitmap copy.
-    exportRange.CopyPicture Appearance:=xlScreen, Format:=xlPicture
+    ' Bitmap copy = pixel-exact snapshot of the filled-in cells. The
+    ' metafile (xlPicture) alternative exports blank in several Excel
+    ' builds, so it is only the fallback.
+    exportRange.CopyPicture Appearance:=xlScreen, Format:=xlBitmap
     chartObj.Chart.Paste
     DoEvents
     If chartObj.Chart.Shapes.Count = 0 Then
-        exportRange.CopyPicture Appearance:=xlScreen, Format:=xlBitmap
+        exportRange.CopyPicture Appearance:=xlScreen, Format:=xlPicture
         chartObj.Chart.Paste
         DoEvents
     End If
@@ -115,12 +119,14 @@ Public Sub PrintPileRecord()
             .Width = chartObj.Width
             .Height = chartObj.Height
         End With
+        .Refresh
         DoEvents  ' let the paste render before exporting
         .Export Filename:=filePath, FilterName:="JPG"
     End With
 
     chartObj.Delete
     Set chartObj = Nothing
+    Application.CutCopyMode = False
     recordSheet.Range("A1").Select  ' drop the chart selection
     Application.ScreenUpdating = previousScreenUpdating
 
