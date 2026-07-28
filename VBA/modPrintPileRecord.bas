@@ -32,6 +32,7 @@ Public Sub PrintPileRecord()
 
     On Error GoTo CleanFail
 
+    previousScreenUpdating = Application.ScreenUpdating
     Set recordSheet = ActiveSheet
 
     ' Only run on a pile record sheet (a copy of Record_Template).
@@ -77,21 +78,38 @@ Public Sub PrintPileRecord()
     On Error GoTo CleanFail
     If exportRange Is Nothing Then Set exportRange = recordSheet.UsedRange
 
-    previousScreenUpdating = Application.ScreenUpdating
-    Application.ScreenUpdating = False
+    ' Screen updating stays ON here: pasting into a chart needs the
+    ' chart genuinely active, and with updating off Excel can skip the
+    ' paste silently, leaving the chart empty ("index out of bounds").
+    Application.ScreenUpdating = True
 
     ' Render the range into a temporary chart and export that as JPG.
-    exportRange.CopyPicture Appearance:=xlScreen, Format:=xlPicture
-
     Set chartObj = recordSheet.ChartObjects.Add( _
         Left:=exportRange.Left, Top:=exportRange.Top, _
         Width:=exportRange.Width * EXPORT_SCALE, _
         Height:=exportRange.Height * EXPORT_SCALE)
+    chartObj.Chart.ChartArea.Format.Line.Visible = msoFalse
+    chartObj.Activate
+
+    ' Copy as a scalable metafile and paste; if Excel drops that paste
+    ' (a known quirk), retry with a plain bitmap copy.
+    exportRange.CopyPicture Appearance:=xlScreen, Format:=xlPicture
+    chartObj.Chart.Paste
+    DoEvents
+    If chartObj.Chart.Shapes.Count = 0 Then
+        exportRange.CopyPicture Appearance:=xlScreen, Format:=xlBitmap
+        chartObj.Chart.Paste
+        DoEvents
+    End If
+    If chartObj.Chart.Shapes.Count = 0 Then
+        Err.Raise vbObjectError + 513, , _
+            "Excel did not paste the sheet picture into the export " & _
+            "chart. Please try again."
+    End If
 
     With chartObj.Chart
-        .ChartArea.Format.Line.Visible = msoFalse
-        .Paste
         With .Shapes(1)
+            .LockAspectRatio = msoFalse
             .Left = 0
             .Top = 0
             .Width = chartObj.Width
@@ -103,6 +121,7 @@ Public Sub PrintPileRecord()
 
     chartObj.Delete
     Set chartObj = Nothing
+    recordSheet.Range("A1").Select  ' drop the chart selection
     Application.ScreenUpdating = previousScreenUpdating
 
     MsgBox "Saved:" & vbCrLf & filePath, vbInformation, "Print pile record"
