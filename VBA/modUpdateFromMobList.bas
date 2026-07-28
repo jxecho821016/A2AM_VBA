@@ -66,31 +66,21 @@ Public Sub UpdateFromMobList()
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
 
-    On Error Resume Next
-    Set sourceBook = Workbooks.Open( _
-        Filename:=linkAddress, ReadOnly:=True, UpdateLinks:=0)
-    On Error GoTo CleanFail
+    Set sourceBook = OpenMobList(linkAddress, sourceSheet)
     If sourceBook Is Nothing Then
         Application.DisplayAlerts = previousAlerts
         Application.ScreenUpdating = previousScreenUpdating
-        MsgBox "Excel could not open the workbook at:" & vbCrLf & _
-               linkAddress & vbCrLf & vbCrLf & _
-               "Check the link in " & LINK_CELL & " and that you are " & _
-               "signed in to OneDrive/SharePoint in Excel.", _
+        MsgBox "Excel could not open the Project Mob List from the " & _
+               "link in " & LINK_CELL & ":" & vbCrLf & linkAddress & _
+               vbCrLf & vbCrLf & _
+               "A SharePoint *share* link (the "":x:/s/..."" kind from " & _
+               """Copy link"") opens a redirect page, not the file. " & _
+               "Use the file's direct path instead:" & vbCrLf & _
+               "1. Open the mob list workbook in Excel." & vbCrLf & _
+               "2. Go to File > Info and click ""Copy path""." & vbCrLf & _
+               "3. Paste that into " & LINK_CELL & " (the macro removes " & _
+               "the ?web=1 ending automatically) and click Update again.", _
                vbExclamation, "Update from mob list"
-        Exit Sub
-    End If
-
-    Set sourceSheet = FindSheet(sourceBook, SOURCE_SHEET)
-    If sourceSheet Is Nothing Then
-        errorMessage = "The opened workbook (" & sourceBook.Name & _
-            ") has no sheet called """ & SOURCE_SHEET & """." & vbCrLf & _
-            "Sheets found: " & SheetNameList(sourceBook)
-        sourceBook.Close SaveChanges:=False
-        Set sourceBook = Nothing
-        Application.DisplayAlerts = previousAlerts
-        Application.ScreenUpdating = previousScreenUpdating
-        MsgBox errorMessage, vbExclamation, "Update from mob list"
         Exit Sub
     End If
 
@@ -138,6 +128,45 @@ CleanFail:
            "list workbook and that you are signed in to OneDrive.", _
            vbExclamation, "Update from mob list"
 End Sub
+
+' Opens the mob list workbook and hands back the Schedule sheet via
+' scheduleSheet. A SharePoint share link served to Workbooks.Open
+' returns a junk single-sheet workbook named after the link token, so
+' every candidate is validated by looking for the Schedule tab; for
+' share links a "?download=1" variant is tried first, which makes
+' SharePoint serve the real file. Returns Nothing when no candidate
+' yields a workbook containing the Schedule sheet.
+Private Function OpenMobList(ByVal linkAddress As String, _
+                             ByRef scheduleSheet As Worksheet) As Workbook
+    Dim candidates As Variant
+    Dim i As Long
+    Dim book As Workbook
+
+    If InStr(1, linkAddress, "/:", vbTextCompare) > 0 Then
+        candidates = Array(linkAddress & "?download=1", linkAddress)
+    Else
+        candidates = Array(linkAddress)
+    End If
+
+    For i = LBound(candidates) To UBound(candidates)
+        Set book = Nothing
+        On Error Resume Next
+        Set book = Workbooks.Open( _
+            Filename:=CStr(candidates(i)), ReadOnly:=True, UpdateLinks:=0)
+        On Error GoTo 0
+
+        If Not book Is Nothing Then
+            Set scheduleSheet = FindSheet(book, SOURCE_SHEET)
+            If Not scheduleSheet Is Nothing Then
+                Set OpenMobList = book
+                Exit Function
+            End If
+            ' Wrong content (e.g. the share-link redirect page opened
+            ' as a workbook) - discard and try the next candidate.
+            book.Close SaveChanges:=False
+        End If
+    Next i
+End Function
 
 ' Sheet lookup that ignores capitalisation and stray spaces in tab
 ' names, so "Summary " or "schedule" still resolve.
