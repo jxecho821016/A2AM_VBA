@@ -43,7 +43,16 @@ Public Sub UpdateFromMobList()
     previousScreenUpdating = Application.ScreenUpdating
     previousAlerts = Application.DisplayAlerts
 
-    Set summarySheet = ThisWorkbook.Worksheets(SUMMARY_SHEET)
+    Set summarySheet = FindSheet(ThisWorkbook, SUMMARY_SHEET)
+    If summarySheet Is Nothing Then
+        MsgBox "This workbook has no sheet called """ & SUMMARY_SHEET & _
+               """." & vbCrLf & "Sheets found: " & _
+               SheetNameList(ThisWorkbook) & vbCrLf & vbCrLf & _
+               "Rename the tab, or change the SUMMARY_SHEET constant " & _
+               "at the top of modUpdateFromMobList.", vbExclamation, _
+               "Update from mob list"
+        Exit Sub
+    End If
 
     linkAddress = MobListLink(summarySheet)
     If Len(linkAddress) = 0 Then
@@ -57,9 +66,33 @@ Public Sub UpdateFromMobList()
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
 
+    On Error Resume Next
     Set sourceBook = Workbooks.Open( _
         Filename:=linkAddress, ReadOnly:=True, UpdateLinks:=0)
-    Set sourceSheet = sourceBook.Worksheets(SOURCE_SHEET)
+    On Error GoTo CleanFail
+    If sourceBook Is Nothing Then
+        Application.DisplayAlerts = previousAlerts
+        Application.ScreenUpdating = previousScreenUpdating
+        MsgBox "Excel could not open the workbook at:" & vbCrLf & _
+               linkAddress & vbCrLf & vbCrLf & _
+               "Check the link in " & LINK_CELL & " and that you are " & _
+               "signed in to OneDrive/SharePoint in Excel.", _
+               vbExclamation, "Update from mob list"
+        Exit Sub
+    End If
+
+    Set sourceSheet = FindSheet(sourceBook, SOURCE_SHEET)
+    If sourceSheet Is Nothing Then
+        errorMessage = "The opened workbook (" & sourceBook.Name & _
+            ") has no sheet called """ & SOURCE_SHEET & """." & vbCrLf & _
+            "Sheets found: " & SheetNameList(sourceBook)
+        sourceBook.Close SaveChanges:=False
+        Set sourceBook = Nothing
+        Application.DisplayAlerts = previousAlerts
+        Application.ScreenUpdating = previousScreenUpdating
+        MsgBox errorMessage, vbExclamation, "Update from mob list"
+        Exit Sub
+    End If
 
     lastRow = sourceSheet.Cells( _
         sourceSheet.Rows.Count, 1).End(xlUp).Row
@@ -105,6 +138,32 @@ CleanFail:
            "list workbook and that you are signed in to OneDrive.", _
            vbExclamation, "Update from mob list"
 End Sub
+
+' Sheet lookup that ignores capitalisation and stray spaces in tab
+' names, so "Summary " or "schedule" still resolve.
+Private Function FindSheet(ByVal book As Workbook, _
+                           ByVal wantedName As String) As Worksheet
+    Dim candidate As Worksheet
+
+    For Each candidate In book.Worksheets
+        If LCase$(Trim$(candidate.Name)) = LCase$(Trim$(wantedName)) Then
+            Set FindSheet = candidate
+            Exit Function
+        End If
+    Next candidate
+End Function
+
+Private Function SheetNameList(ByVal book As Workbook) As String
+    Dim candidate As Worksheet
+    Dim names As String
+
+    For Each candidate In book.Worksheets
+        If Len(names) > 0 Then names = names & ", "
+        names = names & candidate.Name
+    Next candidate
+
+    SheetNameList = names
+End Function
 
 ' The link may be stored as a real hyperlink or as plain text; a share
 ' link's "?e=..." suffix is stripped because Workbooks.Open on some
