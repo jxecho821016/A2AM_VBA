@@ -3,8 +3,9 @@ Option Explicit
 Private Const CACHE_SHEET As String = "_AssetCache"
 Private Const SUBMISSION_LOG_SHEET As String = "_SubmissionLog"
 Private Const MASTER_FILE As String = "Apps\A2AM Master Tracker.xlsx"
-' Fallback web link, used when the "A2AM Master Tracker" row on the
-' Site Details sheet has no link in it.
+' Web link to the Master Tracker. The link stored on the Site Details
+' sheet ("A2AM Master Tracker" row) takes priority; this constant is
+' the fallback if that row is empty or deleted.
 Private Const MASTER_LINK As String = _
     "https://a2am.sharepoint.com/:x:/s/A2AdvancedMonitoring/" & _
     "IQCaaWXJAcaUQ7R66vheIRVVAXhTX2pe1rx6ABQlsP7vJ7g"
@@ -56,7 +57,7 @@ Public Sub CreateNewEntry()
         movementText = "Site -> Office"
     End If
 
-    baseName = Format$(Date, "ddmmyy")
+    baseName = Format$(Date, "yymmdd")
     newName = baseName
     counter = 1
 
@@ -67,24 +68,11 @@ Public Sub CreateNewEntry()
 
     templateSheet.Copy _
         After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
-
-    ' Do not use ActiveSheet here. Excel only reliably activates the
-    ' freshly-copied sheet when Template already happens to sit last in
-    ' the tab order. With ScreenUpdating off (set above) and helper
-    ' sheets such as _AssetCache/_SubmissionLog normally parked at the
-    ' true end of the workbook, ActiveSheet can still be pointing at
-    ' whatever was on screen before this Copy call - which is exactly
-    ' why the bug only showed up once Template stopped being the last
-    ' tab. The copy is always inserted immediately after the sheet
-    ' passed to After:=, which is the last sheet at the time of the
-    ' call, so grabbing the new last sheet by position is correct no
-    ' matter where Template lives or whether it is hidden.
-    Set entrySheet = ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
-    entrySheet.Visible = xlSheetVisible
-
+    Set entrySheet = ActiveSheet
     entrySheet.Name = newName
+
     entrySheet.Range("E8").value = Date
-    entrySheet.Range("E8").NumberFormat = "dd/mm/yyyy"
+    entrySheet.Range("E8").NumberFormat = "yyyy/mm/dd"
 
     With entrySheet.Range("E11").Validation
         .Delete
@@ -188,23 +176,14 @@ Private Sub RefreshEntryAssets(ByVal entrySheet As Worksheet)
             "A Project Code is required in E4 for a demobilisation."
     End If
 
-    ' Prefer a locally synced copy (fast, works offline); otherwise
-    ' open the Master Tracker straight from its SharePoint link.
-    masterPath = MasterTrackerPath(ThisWorkbook.Path)
-    If Len(masterPath) > 0 And Not IsWebAddress(masterPath) Then
-        Set masterBook = OpenWorkbookReadOnly(masterPath, masterWasAlreadyOpen)
-    Else
-        Set masterBook = OpenMasterTrackerFromLink(masterWasAlreadyOpen)
-        If masterBook Is Nothing Then
-            Err.Raise vbObjectError + 1001, , _
-                "The Master Tracker could not be opened. No locally " & _
-                "synced copy was found, and the web link did not open " & _
-                "a workbook containing the """ & MASTER_SHEET & _
-                """ sheet:" & vbCrLf & MasterTrackerLink() & vbCrLf & vbCrLf & _
-                "Check the link in the """ & MASTER_LINK_LABEL & _
-                """ row of the " & SITE_DETAILS_SHEET & " sheet and " & _
-                "that you are signed in to SharePoint in Excel."
-        End If
+    Set masterBook = OpenMasterTrackerFromLink(masterWasAlreadyOpen)
+    If masterBook Is Nothing Then
+        Err.Raise vbObjectError + 1001, , _
+            "The Master Tracker could not be opened from its web link:" & _
+            vbCrLf & MasterTrackerLink() & vbCrLf & vbCrLf & _
+            "Check the link in the ""A2AM Master Tracker"" row of the " & _
+            SITE_DETAILS_SHEET & " sheet and that you are signed in " & _
+            "to SharePoint in Excel."
     End If
     Set masterSheet = masterBook.Worksheets(MASTER_SHEET)
     Set leadCableSheet = masterBook.Worksheets(LEAD_CABLE_SHEET)
@@ -561,9 +540,6 @@ Private Function SheetExists(ByVal sheetName As String) As Boolean
     SheetExists = Not sheet Is Nothing
 End Function
 
-' Locates a locally synced copy of the Master Tracker. Returns "" when
-' none of the known OneDrive locations has it - the caller then falls
-' back to opening MASTER_LINK from SharePoint.
 Private Function MasterTrackerPath(ByVal projectWorkbookPath As String) As String
     Const ROOT_MARKER As String = "\A2 Advanced Monitoring - Documents\"
     Dim markerPosition As Long
@@ -613,7 +589,12 @@ Private Function MasterTrackerPath(ByVal projectWorkbookPath As String) As Strin
         End If
     End If
 
-    MasterTrackerPath = vbNullString
+    Err.Raise vbObjectError + 1002, , _
+        "The locally synced Master Tracker could not be found. Expected:" & _
+        vbCrLf & userProfile & _
+        "\A2 Advanced Monitoring\A2 Advanced Monitoring - Documents\" & _
+        MASTER_FILE & vbCrLf & vbCrLf & _
+        "Make sure that file is available on this device in OneDrive."
 End Function
 
 Private Function LocalDocumentsRoot(ByVal projectWorkbookPath As String) As String
@@ -706,7 +687,7 @@ Private Function SubmissionAlreadyLogged( _
     )
 
     If matchCell Is Nothing Then Exit Function
-    firstAddress = matchCell.Address
+    firstAddress = matchCell.address
 
     Do
         queueFile = Trim$(CStr( _
@@ -724,7 +705,7 @@ Private Function SubmissionAlreadyLogged( _
 
         Set matchCell = searchRange.FindNext(matchCell)
         If matchCell Is Nothing Then Exit Do
-    Loop While matchCell.Address <> firstAddress
+    Loop While matchCell.address <> firstAddress
 End Function
 
 Private Sub LogSubmission( _
@@ -738,7 +719,7 @@ Private Sub LogSubmission( _
 
     logSheet.Cells(nextRow, "A").Value2 = submissionKey
     logSheet.Cells(nextRow, "B").value = Now
-    logSheet.Cells(nextRow, "B").NumberFormat = "dd/mm/yyyy hh:mm:ss"
+    logSheet.Cells(nextRow, "B").NumberFormat = "yyyy/mm/dd hh:mm:ss"
     logSheet.Cells(nextRow, "C").Value2 = queueFile
 End Sub
 
@@ -784,7 +765,7 @@ Private Function MasterTrackerLink() As String
     Dim valueCell As Range
     Dim lastColumn As Long
     Dim col As Long
-    Dim address As String
+    Dim linkText As String
 
     On Error Resume Next
     Set detailsSheet = ThisWorkbook.Worksheets(SITE_DETAILS_SHEET)
@@ -800,18 +781,18 @@ Private Function MasterTrackerLink() As String
             For col = labelCell.Column + 1 To lastColumn
                 Set valueCell = detailsSheet.Cells(labelCell.Row, col)
                 If valueCell.Hyperlinks.Count > 0 Then
-                    address = valueCell.Hyperlinks(1).address
+                    linkText = valueCell.Hyperlinks(1).address
                 Else
-                    address = Trim$(CStr(valueCell.Value))
+                    linkText = Trim$(CStr(valueCell.value))
                 End If
-                If IsWebAddress(address) Then Exit For
-                address = vbNullString
+                If IsWebAddress(linkText) Then Exit For
+                linkText = vbNullString
             Next col
         End If
     End If
 
-    If Len(address) = 0 Then address = MASTER_LINK
-    MasterTrackerLink = address
+    If Len(linkText) = 0 Then linkText = MASTER_LINK
+    MasterTrackerLink = linkText
 End Function
 
 ' Opens the Master Tracker from its web link. A workbook that is
@@ -849,7 +830,7 @@ Private Function OpenMasterTrackerFromLink( _
         Set book = Nothing
         On Error Resume Next
         Set book = Workbooks.Open( _
-            Filename:=CStr(candidates(i)), _
+            fileName:=CStr(candidates(i)), _
             UpdateLinks:=False, _
             ReadOnly:=True, _
             AddToMru:=False _
@@ -862,8 +843,8 @@ Private Function OpenMasterTrackerFromLink( _
                 wasAlreadyOpen = False
                 Exit Function
             End If
-            ' Wrong content (e.g. a share-link redirect page opened as
-            ' a workbook) - discard and try the next candidate.
+            'Wrong content (e.g. a share-link redirect page opened as
+            'a workbook) - discard and try the next candidate.
             book.Close SaveChanges:=False
         End If
     Next i
@@ -897,7 +878,7 @@ Private Function OpenWorkbookReadOnly( _
     Next book
 
     Set OpenWorkbookReadOnly = Workbooks.Open( _
-        Filename:=fullPath, _
+        fileName:=fullPath, _
         UpdateLinks:=False, _
         ReadOnly:=True, _
         AddToMru:=False _
