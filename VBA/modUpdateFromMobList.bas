@@ -75,11 +75,15 @@ Public Sub UpdateFromMobList()
                vbCrLf & vbCrLf & _
                "A SharePoint *share* link (the "":x:/s/..."" kind from " & _
                """Copy link"") opens a redirect page, not the file. " & _
-               "Use the file's direct path instead:" & vbCrLf & _
-               "1. Open the mob list workbook in Excel." & vbCrLf & _
-               "2. Go to File > Info and click ""Copy path""." & vbCrLf & _
-               "3. Paste that into " & LINK_CELL & " (the macro removes " & _
-               "the ?web=1 ending automatically) and click Update again.", _
+               "Put the file's direct path in " & LINK_CELL & " instead:" & _
+               vbCrLf & _
+               "- Windows: open the mob list in Excel, File > Info, " & _
+               "click ""Copy path""." & vbCrLf & _
+               "- Mac: open the SharePoint folder in a browser, click " & _
+               "the file's Details (i) icon, and copy the ""Path"" at " & _
+               "the bottom of the pane." & vbCrLf & _
+               "Then paste it into " & LINK_CELL & " (any ?web=1 ending " & _
+               "is removed automatically) and click Update again.", _
                vbExclamation, "Update from mob list"
         Exit Sub
     End If
