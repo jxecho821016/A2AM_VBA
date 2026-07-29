@@ -3,6 +3,13 @@ Option Explicit
 Private Const CACHE_SHEET As String = "_AssetCache"
 Private Const SUBMISSION_LOG_SHEET As String = "_SubmissionLog"
 Private Const MASTER_FILE As String = "Apps\A2AM Master Tracker.xlsx"
+' Fallback web link, used when the "A2AM Master Tracker" row on the
+' Site Details sheet has no link in it.
+Private Const MASTER_LINK As String = _
+    "https://a2am.sharepoint.com/:x:/s/A2AdvancedMonitoring/" & _
+    "IQCaaWXJAcaUQ7R66vheIRVVAXhTX2pe1rx6ABQlsP7vJ7g"
+Private Const SITE_DETAILS_SHEET As String = "Site Details"
+Private Const MASTER_LINK_LABEL As String = "Master Tracker"
 Private Const MASTER_SHEET As String = "Equipment"
 Private Const LEAD_CABLE_SHEET As String = "Lead Cables"
 Private Const ITEM_HEADER_ROW As Long = 15
@@ -181,14 +188,24 @@ Private Sub RefreshEntryAssets(ByVal entrySheet As Worksheet)
             "A Project Code is required in E4 for a demobilisation."
     End If
 
+    ' Prefer a locally synced copy (fast, works offline); otherwise
+    ' open the Master Tracker straight from its SharePoint link.
     masterPath = MasterTrackerPath(ThisWorkbook.Path)
-    If IsWebAddress(masterPath) Or Len(Dir$(masterPath)) = 0 Then
-        Err.Raise vbObjectError + 1001, , _
-            "The locally synced Master Tracker was not found at:" & _
-            vbCrLf & masterPath
+    If Len(masterPath) > 0 And Not IsWebAddress(masterPath) Then
+        Set masterBook = OpenWorkbookReadOnly(masterPath, masterWasAlreadyOpen)
+    Else
+        Set masterBook = OpenMasterTrackerFromLink(masterWasAlreadyOpen)
+        If masterBook Is Nothing Then
+            Err.Raise vbObjectError + 1001, , _
+                "The Master Tracker could not be opened. No locally " & _
+                "synced copy was found, and the web link did not open " & _
+                "a workbook containing the """ & MASTER_SHEET & _
+                """ sheet:" & vbCrLf & MasterTrackerLink() & vbCrLf & vbCrLf & _
+                "Check the link in the """ & MASTER_LINK_LABEL & _
+                """ row of the " & SITE_DETAILS_SHEET & " sheet and " & _
+                "that you are signed in to SharePoint in Excel."
+        End If
     End If
-
-    Set masterBook = OpenWorkbookReadOnly(masterPath, masterWasAlreadyOpen)
     Set masterSheet = masterBook.Worksheets(MASTER_SHEET)
     Set leadCableSheet = masterBook.Worksheets(LEAD_CABLE_SHEET)
     If direction = "office -> site" Then
@@ -544,6 +561,9 @@ Private Function SheetExists(ByVal sheetName As String) As Boolean
     SheetExists = Not sheet Is Nothing
 End Function
 
+' Locates a locally synced copy of the Master Tracker. Returns "" when
+' none of the known OneDrive locations has it - the caller then falls
+' back to opening MASTER_LINK from SharePoint.
 Private Function MasterTrackerPath(ByVal projectWorkbookPath As String) As String
     Const ROOT_MARKER As String = "\A2 Advanced Monitoring - Documents\"
     Dim markerPosition As Long
@@ -593,12 +613,7 @@ Private Function MasterTrackerPath(ByVal projectWorkbookPath As String) As Strin
         End If
     End If
 
-    Err.Raise vbObjectError + 1002, , _
-        "The locally synced Master Tracker could not be found. Expected:" & _
-        vbCrLf & userProfile & _
-        "\A2 Advanced Monitoring\A2 Advanced Monitoring - Documents\" & _
-        MASTER_FILE & vbCrLf & vbCrLf & _
-        "Make sure that file is available on this device in OneDrive."
+    MasterTrackerPath = vbNullString
 End Function
 
 Private Function LocalDocumentsRoot(ByVal projectWorkbookPath As String) As String
@@ -757,6 +772,114 @@ Private Function IsWebAddress(ByVal value As String) As Boolean
     IsWebAddress = _
         Left$(normalised, 8) = "https://" Or _
         Left$(normalised, 7) = "http://"
+End Function
+
+' Reads the Master Tracker web link from the Site Details sheet: the
+' row labelled "A2AM Master Tracker", first cell to the label's right
+' holding a hyperlink or web address. Falls back to the MASTER_LINK
+' constant so the macro still works if that row is deleted.
+Private Function MasterTrackerLink() As String
+    Dim detailsSheet As Worksheet
+    Dim labelCell As Range
+    Dim valueCell As Range
+    Dim lastColumn As Long
+    Dim col As Long
+    Dim address As String
+
+    On Error Resume Next
+    Set detailsSheet = ThisWorkbook.Worksheets(SITE_DETAILS_SHEET)
+    On Error GoTo 0
+
+    If Not detailsSheet Is Nothing Then
+        Set labelCell = detailsSheet.UsedRange.Find( _
+            What:=MASTER_LINK_LABEL, LookIn:=xlValues, _
+            LookAt:=xlPart, MatchCase:=False)
+        If Not labelCell Is Nothing Then
+            lastColumn = detailsSheet.UsedRange.Column + _
+                         detailsSheet.UsedRange.Columns.Count - 1
+            For col = labelCell.Column + 1 To lastColumn
+                Set valueCell = detailsSheet.Cells(labelCell.Row, col)
+                If valueCell.Hyperlinks.Count > 0 Then
+                    address = valueCell.Hyperlinks(1).address
+                Else
+                    address = Trim$(CStr(valueCell.Value))
+                End If
+                If IsWebAddress(address) Then Exit For
+                address = vbNullString
+            Next col
+        End If
+    End If
+
+    If Len(address) = 0 Then address = MASTER_LINK
+    MasterTrackerLink = address
+End Function
+
+' Opens the Master Tracker from its web link. A workbook that is
+' already open and contains the Equipment and Lead Cables sheets is
+' reused. Share links are tried with a "?download=1" suffix first,
+' which makes SharePoint serve the real file instead of a redirect
+' page; every candidate is validated by the presence of the Equipment
+' sheet. Returns Nothing when no candidate yields the tracker.
+Private Function OpenMasterTrackerFromLink( _
+    ByRef wasAlreadyOpen As Boolean _
+) As Workbook
+    Dim book As Workbook
+    Dim linkAddress As String
+    Dim candidates As Variant
+    Dim i As Long
+    Dim queryPos As Long
+
+    For Each book In Application.Workbooks
+        If Not book Is ThisWorkbook Then
+            If BookHasSheet(book, MASTER_SHEET) And _
+               BookHasSheet(book, LEAD_CABLE_SHEET) Then
+                Set OpenMasterTrackerFromLink = book
+                wasAlreadyOpen = True
+                Exit Function
+            End If
+        End If
+    Next book
+
+    linkAddress = Trim$(MasterTrackerLink())
+    queryPos = InStr(1, linkAddress, "?")
+    If queryPos > 0 Then linkAddress = Left$(linkAddress, queryPos - 1)
+
+    candidates = Array(linkAddress & "?download=1", linkAddress)
+    For i = LBound(candidates) To UBound(candidates)
+        Set book = Nothing
+        On Error Resume Next
+        Set book = Workbooks.Open( _
+            Filename:=CStr(candidates(i)), _
+            UpdateLinks:=False, _
+            ReadOnly:=True, _
+            AddToMru:=False _
+        )
+        On Error GoTo 0
+
+        If Not book Is Nothing Then
+            If BookHasSheet(book, MASTER_SHEET) Then
+                Set OpenMasterTrackerFromLink = book
+                wasAlreadyOpen = False
+                Exit Function
+            End If
+            ' Wrong content (e.g. a share-link redirect page opened as
+            ' a workbook) - discard and try the next candidate.
+            book.Close SaveChanges:=False
+        End If
+    Next i
+End Function
+
+Private Function BookHasSheet( _
+    ByVal book As Workbook, _
+    ByVal sheetName As String _
+) As Boolean
+    Dim candidate As Worksheet
+
+    On Error Resume Next
+    Set candidate = book.Worksheets(sheetName)
+    On Error GoTo 0
+
+    BookHasSheet = Not candidate Is Nothing
 End Function
 
 Private Function OpenWorkbookReadOnly( _
