@@ -10,6 +10,13 @@ Option Explicit
 ' Everything downstream (Cable Stock formulas, charts) then updates
 ' itself as it already does.
 '
+' The response sheets hold Excel Tables, and the tracker's formulas
+' address them with structured references such as
+' CableInventoryResponse[15m Ordered Cable]. New rows are therefore
+' added THROUGH the table (the table is resized to include them);
+' writing to the cells underneath would leave the rows outside the
+' table where no structured-reference formula can see them.
+'
 ' Columns are matched by HEADER NAME, not by position, so the source
 ' and destination column orders may differ and extra calculated
 ' columns in the tracker are left untouched.
@@ -33,7 +40,7 @@ Private Const MOB_DEST_SHEET As String = "ProjectMobDemobResponse"
 
 ' Header names treated as a unique row ID, in order of preference.
 Private Const KEY_HEADERS As String = _
-    "id,responseid,submissionid,startTime,starttime"
+    "id,responseid,submissionid,starttime"
 
 Public Sub UpdateResponses()
     Dim report As String
@@ -52,6 +59,10 @@ Public Sub UpdateResponses()
 
     cableReport = ImportResponses(CABLE_SOURCE_FILE, CABLE_DEST_SHEET)
     mobReport = ImportResponses(MOB_SOURCE_FILE, MOB_DEST_SHEET)
+
+    ' Structured-reference formulas only pick the new rows up once the
+    ' resized tables have been recalculated.
+    Application.CalculateFull
 
     Application.DisplayAlerts = previousAlerts
     Application.ScreenUpdating = previousScreenUpdating
@@ -79,10 +90,17 @@ Private Function ImportResponses( _
     ByVal destSheetName As String _
 ) As String
     Dim destSheet As Worksheet
+    Dim destTable As ListObject
+    Dim destHeaderRange As Range
+    Dim destDataRange As Range
     Dim sourceBook As Workbook
     Dim sourceSheet As Worksheet
+    Dim sourceTable As ListObject
+    Dim sourceHeaderRange As Range
+    Dim sourceDataRange As Range
     Dim sourcePath As String
     Dim sourceValues As Variant
+    Dim destValues As Variant
     Dim destHeaders As Variant
     Dim sourceHeaders As Variant
     Dim columnMap As Variant
@@ -92,7 +110,6 @@ Private Function ImportResponses( _
     Dim outputBlock As Variant
     Dim rowKey As String
     Dim keyColumn As Long
-    Dim lastDestRow As Long
     Dim sourceRow As Long
     Dim sourceCol As Long
     Dim destCol As Long
@@ -106,6 +123,13 @@ Private Function ImportResponses( _
     If destSheet Is Nothing Then
         ImportResponses = "skipped - this workbook has no """ & _
                           destSheetName & """ sheet."
+        Exit Function
+    End If
+
+    GetSheetLayout destSheet, destTable, destHeaderRange, destDataRange
+    If destHeaderRange Is Nothing Then
+        ImportResponses = "skipped - no header row on """ & _
+                          destSheetName & """."
         Exit Function
     End If
 
@@ -125,16 +149,17 @@ Private Function ImportResponses( _
 
     ' Forms response workbooks keep the responses on the first sheet.
     Set sourceSheet = sourceBook.Worksheets(1)
+    GetSheetLayout sourceSheet, sourceTable, sourceHeaderRange, sourceDataRange
 
-    destHeaders = HeaderKeys(destSheet)
-    sourceHeaders = HeaderKeys(sourceSheet)
-
-    If UBound(sourceHeaders) < 1 Or UBound(destHeaders) < 1 Then
+    If sourceHeaderRange Is Nothing Then
         sourceBook.Close SaveChanges:=False
         On Error GoTo 0
-        ImportResponses = "skipped - no header row found."
+        ImportResponses = "skipped - no header row in " & sourceFileName & "."
         Exit Function
     End If
+
+    destHeaders = HeaderKeys(destHeaderRange)
+    sourceHeaders = HeaderKeys(sourceHeaderRange)
 
     ' Map each source column to the destination column with the same
     ' header. Unmatched source columns are ignored.
@@ -164,10 +189,11 @@ Private Function ImportResponses( _
 
     ' Existing rows, so nothing is imported twice - including rows the
     ' Power Automate flow already copied.
+    destValues = RangeValues(destDataRange)
     Set existingKeys = ExistingRowKeys( _
-        destSheet, destHeaders, sourceHeaders, columnMap, keyColumn)
+        destValues, UBound(sourceHeaders), columnMap, keyColumn)
 
-    sourceValues = ResponseValues(sourceSheet, UBound(sourceHeaders))
+    sourceValues = RangeValues(sourceDataRange)
     Set newRows = New Collection
 
     If Not IsEmpty(sourceValues) Then
@@ -202,9 +228,8 @@ Private Function ImportResponses( _
             Next destCol
         Next i
 
-        lastDestRow = LastDataRow(destSheet, UBound(destHeaders))
-        destSheet.Cells(lastDestRow + 1, 1) _
-            .Resize(addedCount, UBound(destHeaders)).value = outputBlock
+        AppendRows destSheet, destTable, destHeaderRange, destDataRange, _
+                   outputBlock, addedCount, UBound(destHeaders)
     End If
 
     sourceBook.Close SaveChanges:=False
@@ -224,47 +249,113 @@ CleanFail:
     ImportResponses = "failed - " & Err.Description
 End Function
 
-' Header row of a sheet as normalised keys, 1-based by column.
-Private Function HeaderKeys(ByVal sheet As Worksheet) As Variant
+' Header and data ranges of a sheet. When the sheet holds an Excel
+' Table the table defines them, so structured-reference formulas and
+' this import agree on where the data is.
+Private Sub GetSheetLayout( _
+    ByVal sheet As Worksheet, _
+    ByRef sheetTable As ListObject, _
+    ByRef headerRange As Range, _
+    ByRef dataRange As Range _
+)
     Dim lastColumn As Long
-    Dim keys() As String
-    Dim col As Long
+    Dim lastRow As Long
+
+    Set sheetTable = Nothing
+    Set headerRange = Nothing
+    Set dataRange = Nothing
+
+    If sheet.ListObjects.Count > 0 Then
+        Set sheetTable = sheet.ListObjects(1)
+        Set headerRange = sheetTable.HeaderRowRange
+        If Not sheetTable.DataBodyRange Is Nothing Then
+            Set dataRange = sheetTable.DataBodyRange
+        End If
+        Exit Sub
+    End If
 
     lastColumn = sheet.Cells(HEADER_ROW, sheet.Columns.Count) _
         .End(xlToLeft).Column
-    If lastColumn < 1 Then lastColumn = 1
+    If lastColumn < 1 Then Exit Sub
+    If Len(Trim$(CStr(sheet.Cells(HEADER_ROW, 1).value))) = 0 And _
+       lastColumn = 1 Then Exit Sub
 
-    ReDim keys(1 To lastColumn)
-    For col = 1 To lastColumn
-        keys(col) = NormaliseKey(sheet.Cells(HEADER_ROW, col).value)
+    Set headerRange = sheet.Cells(HEADER_ROW, 1).Resize(1, lastColumn)
+
+    lastRow = LastDataRow(sheet, lastColumn)
+    If lastRow > HEADER_ROW Then
+        Set dataRange = sheet.Cells(HEADER_ROW + 1, 1) _
+            .Resize(lastRow - HEADER_ROW, lastColumn)
+    End If
+End Sub
+
+' Writes the new rows and, for a table, resizes it to take them in.
+' Structured references only see rows inside the table's range.
+Private Sub AppendRows( _
+    ByVal destSheet As Worksheet, _
+    ByVal destTable As ListObject, _
+    ByVal destHeaderRange As Range, _
+    ByVal destDataRange As Range, _
+    ByVal outputBlock As Variant, _
+    ByVal rowCount As Long, _
+    ByVal columnCount As Long _
+)
+    Dim firstColumn As Long
+    Dim writeStart As Range
+    Dim lastCell As Range
+
+    firstColumn = destHeaderRange.Column
+
+    If destDataRange Is Nothing Then
+        ' Header only: the first data row sits directly beneath it.
+        Set writeStart = destSheet.Cells(destHeaderRange.Row + 1, firstColumn)
+    ElseIf destDataRange.Rows.Count = 1 And IsBlankRange(destDataRange) Then
+        ' A new table keeps one empty placeholder row - fill that first.
+        Set writeStart = destSheet.Cells(destDataRange.Row, firstColumn)
+    Else
+        Set writeStart = destSheet.Cells( _
+            destDataRange.Row + destDataRange.Rows.Count, firstColumn)
+    End If
+
+    writeStart.Resize(rowCount, columnCount).value = outputBlock
+
+    If destTable Is Nothing Then Exit Sub
+
+    Set lastCell = writeStart.Offset(rowCount - 1, columnCount - 1)
+    destTable.Resize destSheet.Range(destHeaderRange.Cells(1, 1), lastCell)
+End Sub
+
+' Header row as normalised keys, 1-based within the header range.
+Private Function HeaderKeys(ByVal headerRange As Range) As Variant
+    Dim keys() As String
+    Dim col As Long
+
+    ReDim keys(1 To headerRange.Columns.Count)
+    For col = 1 To headerRange.Columns.Count
+        keys(col) = NormaliseKey(headerRange.Cells(1, col).value)
     Next col
 
     HeaderKeys = keys
 End Function
 
-' All response rows below the header as a 2-D array (or Empty).
-Private Function ResponseValues( _
-    ByVal sheet As Worksheet, _
-    ByVal columnCount As Long _
-) As Variant
-    Dim lastRow As Long
+' Range contents as a 2-D array, or Empty when there is no data.
+Private Function RangeValues(ByVal target As Range) As Variant
     Dim block As Variant
+    Dim single_(1 To 1, 1 To 1) As Variant
 
-    lastRow = LastDataRow(sheet, columnCount)
-    If lastRow <= HEADER_ROW Then Exit Function
+    If target Is Nothing Then Exit Function
 
-    block = sheet.Cells(HEADER_ROW + 1, 1) _
-        .Resize(lastRow - HEADER_ROW, columnCount).value
-
-    ' A single row comes back as a plain value when only one column is
-    ' involved; force a 2-D shape for the caller.
-    If Not IsArray(block) Then
-        Dim single_(1 To 1, 1 To 1) As Variant
-        single_(1, 1) = block
-        ResponseValues = single_
+    block = target.value
+    If IsArray(block) Then
+        RangeValues = block
     Else
-        ResponseValues = block
+        single_(1, 1) = block
+        RangeValues = single_
     End If
+End Function
+
+Private Function IsBlankRange(ByVal target As Range) As Boolean
+    IsBlankRange = (Application.WorksheetFunction.CountA(target) = 0)
 End Function
 
 ' Last row holding data across the given columns.
@@ -299,19 +390,16 @@ Private Function PreferredKeyColumn(ByVal sourceHeaders As Variant) As Long
     Next i
 End Function
 
-' Keys of the rows already in the destination sheet, built the same
+' Keys of the rows already in the destination table, built the same
 ' way as the source keys so the two are comparable.
 Private Function ExistingRowKeys( _
-    ByVal destSheet As Worksheet, _
-    ByVal destHeaders As Variant, _
-    ByVal sourceHeaders As Variant, _
+    ByVal destValues As Variant, _
+    ByVal sourceColumnCount As Long, _
     ByVal columnMap As Variant, _
     ByVal keyColumn As Long _
 ) As Collection
     Dim keys As Collection
-    Dim destValues As Variant
     Dim mirrored As Variant
-    Dim lastRow As Long
     Dim destRow As Long
     Dim sourceCol As Long
     Dim destCol As Long
@@ -320,17 +408,12 @@ Private Function ExistingRowKeys( _
     Set keys = New Collection
     Set ExistingRowKeys = keys
 
-    lastRow = LastDataRow(destSheet, UBound(destHeaders))
-    If lastRow <= HEADER_ROW Then Exit Function
-
-    destValues = destSheet.Cells(HEADER_ROW + 1, 1) _
-        .Resize(lastRow - HEADER_ROW, UBound(destHeaders)).value
-    If Not IsArray(destValues) Then Exit Function
+    If IsEmpty(destValues) Then Exit Function
 
     ' Re-shape each destination row into source-column order so the
     ' same RowKey routine produces a comparable key.
     For destRow = 1 To UBound(destValues, 1)
-        ReDim mirrored(1 To 1, 1 To UBound(sourceHeaders))
+        ReDim mirrored(1 To 1, 1 To sourceColumnCount)
         For sourceCol = 1 To UBound(columnMap)
             destCol = columnMap(sourceCol)
             If destCol > 0 Then
@@ -396,9 +479,9 @@ Private Function NormaliseKey(ByVal rawValue As Variant) As String
     End If
     If IsEmpty(rawValue) Then Exit Function
 
-    If IsDate(rawValue) And Not VarType(rawValue) = vbString Then
+    If VarType(rawValue) = vbDate Then
         text = Format$(CDate(rawValue), "yyyy-mm-dd hh:nn:ss")
-    ElseIf IsNumeric(rawValue) And Not VarType(rawValue) = vbString Then
+    ElseIf IsNumeric(rawValue) And VarType(rawValue) <> vbString Then
         text = Format$(CDbl(rawValue), "0.##########")
     Else
         text = CStr(rawValue)
