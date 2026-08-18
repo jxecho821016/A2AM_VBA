@@ -26,6 +26,9 @@ Option Explicit
 ' otherwise a fingerprint of the whole row. Existing rows are never
 ' modified or reordered - new rows are only ever appended below.
 '
+' The same click then brings the Lead Cables tab up to date from the
+' cable inventory responses - see SyncLeadCablesFromResponses.
+'
 ' Works in Excel for Mac and Windows. Nothing is saved automatically;
 ' review the result, then save the tracker yourself.
 
@@ -46,6 +49,7 @@ Public Sub UpdateResponses()
     Dim report As String
     Dim cableReport As String
     Dim mobReport As String
+    Dim leadReport As String
     Dim previousScreenUpdating As Boolean
     Dim previousAlerts As Boolean
     Dim errorMessage As String
@@ -59,6 +63,7 @@ Public Sub UpdateResponses()
 
     cableReport = ImportResponses(CABLE_SOURCE_FILE, CABLE_DEST_SHEET)
     mobReport = ImportResponses(MOB_SOURCE_FILE, MOB_DEST_SHEET)
+    leadReport = SyncLeadCablesFromResponses()
 
     ' Structured-reference formulas only pick the new rows up once the
     ' resized tables have been recalculated.
@@ -70,6 +75,8 @@ Public Sub UpdateResponses()
     report = "Cable Inventory:" & vbCrLf & "  " & cableReport & vbCrLf & _
              vbCrLf & _
              "Project Mob / Demob:" & vbCrLf & "  " & mobReport & vbCrLf & _
+             vbCrLf & _
+             "Lead Cables:" & vbCrLf & "  " & leadReport & vbCrLf & _
              vbCrLf & "Save the tracker to keep the imported rows."
 
     MsgBox report, vbInformation, "Update responses"
@@ -248,6 +255,510 @@ CleanFail:
     On Error GoTo 0
     ImportResponses = "failed - " & Err.Description
 End Function
+
+' ---------------------------------------------------------------
+' Lead Cables tab
+' ---------------------------------------------------------------
+'
+' Brings the Lead Cables tab up to date from the cable inventory
+' responses. Run by the UPDATE button, or on its own.
+'
+' Lead Cable Prep entries (up to 4 per submission):
+'   - ID already on the tab -> that row is updated (sensors, length,
+'     initials, tested date, and condition when the logger test
+'     passed). Location and Project Code are left alone, because the
+'     cable's whereabouts are maintained on this tab, not by the form.
+'   - ID not on the tab     -> a new row is added. Lead Type comes
+'     from the ID prefix (SL... = OS2, L... = OM3), Location starts
+'     as Office and Project Code is left empty.
+'
+' Repair entries (up to 5 per submission) never create rows: the
+' matching cable's tested date is set to the repair date, and its
+' condition is refreshed when the logger test passed. A repair for an
+' ID that is not on the tab is counted and reported.
+'
+' Rows are read in submission order, so the most recent response for
+' a cable is the one that sticks. Re-running changes nothing unless
+' new responses have arrived.
+
+Private Const LEAD_CABLES_SHEET As String = "Lead Cables"
+Private Const MAX_PREP_BLOCKS As Long = 4
+Private Const MAX_REPAIR_BLOCKS As Long = 5
+Private Const NEW_CABLE_LOCATION As String = "Office"
+Private Const TESTED_CONDITION As String = "All CH Works"
+
+Public Sub SyncLeadCables()
+    Dim previousScreenUpdating As Boolean
+    Dim report As String
+
+    previousScreenUpdating = Application.ScreenUpdating
+    Application.ScreenUpdating = False
+
+    report = SyncLeadCablesFromResponses()
+
+    Application.ScreenUpdating = previousScreenUpdating
+    MsgBox report, vbInformation, "Lead Cables"
+End Sub
+
+Private Function SyncLeadCablesFromResponses() As String
+    Dim respSheet As Worksheet
+    Dim leadSheet As Worksheet
+    Dim respTable As ListObject
+    Dim leadTable As ListObject
+    Dim respHeaderRange As Range
+    Dim respDataRange As Range
+    Dim leadHeaderRange As Range
+    Dim leadDataRange As Range
+    Dim respHeaders As Variant
+    Dim leadHeaders As Variant
+    Dim respValues As Variant
+    Dim rowIndex As Long
+    Dim leadFirstColumn As Long
+    Dim leadColumnCount As Long
+    Dim idIndex As Collection
+    Dim addedCount As Long
+    Dim updatedCount As Long
+    Dim repairedCount As Long
+    Dim unmatchedRepairs As Long
+    Dim errorMessage As String
+
+    On Error GoTo CleanFail
+
+    Set respSheet = FindSheet(ThisWorkbook, CABLE_DEST_SHEET)
+    If respSheet Is Nothing Then
+        SyncLeadCablesFromResponses = "skipped - no """ & _
+            CABLE_DEST_SHEET & """ sheet."
+        Exit Function
+    End If
+
+    Set leadSheet = FindSheet(ThisWorkbook, LEAD_CABLES_SHEET)
+    If leadSheet Is Nothing Then
+        SyncLeadCablesFromResponses = "skipped - no """ & _
+            LEAD_CABLES_SHEET & """ sheet."
+        Exit Function
+    End If
+
+    GetSheetLayout respSheet, respTable, respHeaderRange, respDataRange
+    GetSheetLayout leadSheet, leadTable, leadHeaderRange, leadDataRange
+
+    If respHeaderRange Is Nothing Or leadHeaderRange Is Nothing Then
+        SyncLeadCablesFromResponses = "skipped - header row not found."
+        Exit Function
+    End If
+
+    respValues = RangeValues(respDataRange)
+    If IsEmpty(respValues) Then
+        SyncLeadCablesFromResponses = "nothing to do - no responses yet."
+        Exit Function
+    End If
+
+    respHeaders = HeaderKeys(respHeaderRange)
+    leadHeaders = HeaderKeys(leadHeaderRange)
+    leadFirstColumn = leadHeaderRange.Column
+    leadColumnCount = leadHeaderRange.Columns.Count
+
+    Set idIndex = LeadCableIndex( _
+        leadSheet, leadHeaders, leadHeaderRange, leadDataRange)
+
+    For rowIndex = 1 To UBound(respValues, 1)
+        ApplyPrepBlocks respValues, rowIndex, respHeaders, leadSheet, _
+            leadHeaders, leadFirstColumn, leadColumnCount, idIndex, _
+            addedCount, updatedCount
+        ApplyRepairBlocks respValues, rowIndex, respHeaders, leadSheet, _
+            leadHeaders, leadFirstColumn, idIndex, _
+            repairedCount, unmatchedRepairs
+    Next rowIndex
+
+    SyncLeadCablesFromResponses = _
+        addedCount & " cable(s) added, " & _
+        updatedCount & " prep update(s), " & _
+        repairedCount & " repair date(s) updated" & _
+        IIf(unmatchedRepairs > 0, _
+            " (" & unmatchedRepairs & " repair ID not on the tab)", _
+            vbNullString) & "."
+    Exit Function
+
+CleanFail:
+    errorMessage = Err.Description
+    SyncLeadCablesFromResponses = "failed - " & errorMessage
+End Function
+
+' Maps each Lead Cable ID to the sheet row holding it.
+Private Function LeadCableIndex( _
+    ByVal leadSheet As Worksheet, _
+    ByVal leadHeaders As Variant, _
+    ByVal leadHeaderRange As Range, _
+    ByVal leadDataRange As Range _
+) As Collection
+    Dim index As Collection
+    Dim idColumn As Long
+    Dim sheetColumn As Long
+    Dim rowNumber As Long
+    Dim lastRow As Long
+    Dim cableId As String
+
+    Set index = New Collection
+    Set LeadCableIndex = index
+
+    If leadDataRange Is Nothing Then Exit Function
+
+    idColumn = HeaderColumn(leadHeaders, "ID")
+    If idColumn = 0 Then Exit Function
+
+    sheetColumn = leadHeaderRange.Column + idColumn - 1
+    lastRow = leadDataRange.Row + leadDataRange.Rows.Count - 1
+
+    For rowNumber = leadDataRange.Row To lastRow
+        cableId = CompactKey(CStr(leadSheet.Cells(rowNumber, sheetColumn).value))
+        If Len(cableId) > 0 Then
+            On Error Resume Next
+            index.Add rowNumber, cableId
+            On Error GoTo 0
+        End If
+    Next rowNumber
+End Function
+
+' Lead Cable Prep blocks: update the cable's row, or add it.
+Private Sub ApplyPrepBlocks( _
+    ByVal respValues As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal respHeaders As Variant, _
+    ByVal leadSheet As Worksheet, _
+    ByVal leadHeaders As Variant, _
+    ByVal leadFirstColumn As Long, _
+    ByVal leadColumnCount As Long, _
+    ByVal idIndex As Collection, _
+    ByRef addedCount As Long, _
+    ByRef updatedCount As Long _
+)
+    Dim block As Long
+    Dim idColumn As Long
+    Dim sensorsColumn As Long
+    Dim lengthColumn As Long
+    Dim testedColumn As Long
+    Dim cableId As String
+    Dim testedText As String
+    Dim testedDate As Variant
+    Dim targetRow As Long
+    Dim newValues As Variant
+    Dim i As Long
+
+    For block = 1 To MAX_PREP_BLOCKS
+        idColumn = HeaderColumn(respHeaders, block & ". Lead Cable Prep ID")
+
+        If idColumn > 0 Then
+            cableId = Trim$(CStr(SafeValue(respValues, rowIndex, idColumn)))
+
+            If Len(cableId) > 0 Then
+                sensorsColumn = HeaderColumn(respHeaders, _
+                    block & ". How many channels prepped on both sides?")
+                lengthColumn = HeaderColumn(respHeaders, _
+                    block & ". What's the length of the lead cable?")
+                testedColumn = HeaderColumn(respHeaders, _
+                    block & ". Have you tested with the logger (prep)?")
+
+                testedText = LCase$(Trim$(CStr( _
+                    SafeValue(respValues, rowIndex, testedColumn))))
+                testedDate = ResponseDate(respValues, rowIndex, respHeaders)
+
+                targetRow = IndexedRow(idIndex, cableId)
+
+                If targetRow > 0 Then
+                    SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Sensors", _
+                        SafeValue(respValues, rowIndex, sensorsColumn)
+                    SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Length", _
+                        SafeValue(respValues, rowIndex, lengthColumn)
+                    SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Initials", _
+                        ResponseInitials(respValues, rowIndex, respHeaders)
+                    SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Tested Date", testedDate
+                    If testedText = "yes" Then
+                        SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                            leadHeaders, "Condition", TESTED_CONDITION
+                    End If
+                    ' Fill the type in only when it is still blank, so a
+                    ' hand-corrected Lead Type is never overwritten.
+                    SetLeadCellIfBlank leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Lead Type", LeadTypeFromId(cableId)
+                    updatedCount = updatedCount + 1
+                Else
+                    ReDim newValues(1 To leadColumnCount)
+                    For i = 1 To leadColumnCount
+                        newValues(i) = Empty
+                    Next i
+
+                    PutLeadValue newValues, leadHeaders, "Lead Type", _
+                        LeadTypeFromId(cableId)
+                    PutLeadValue newValues, leadHeaders, "ID", cableId
+                    PutLeadValue newValues, leadHeaders, "Sensors", _
+                        SafeValue(respValues, rowIndex, sensorsColumn)
+                    PutLeadValue newValues, leadHeaders, "Length", _
+                        SafeValue(respValues, rowIndex, lengthColumn)
+                    PutLeadValue newValues, leadHeaders, "Initials", _
+                        ResponseInitials(respValues, rowIndex, respHeaders)
+                    PutLeadValue newValues, leadHeaders, "Location", _
+                        NEW_CABLE_LOCATION
+                    If testedText = "yes" Then
+                        PutLeadValue newValues, leadHeaders, "Condition", _
+                            TESTED_CONDITION
+                    End If
+                    PutLeadValue newValues, leadHeaders, "Tested Date", _
+                        testedDate
+
+                    targetRow = AppendLeadRow( _
+                        leadSheet, newValues, leadColumnCount)
+                    On Error Resume Next
+                    idIndex.Add targetRow, CompactKey(cableId)
+                    On Error GoTo 0
+                    addedCount = addedCount + 1
+                End If
+            End If
+        End If
+    Next block
+End Sub
+
+' Repair blocks: refresh the tested date on an existing cable only.
+Private Sub ApplyRepairBlocks( _
+    ByVal respValues As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal respHeaders As Variant, _
+    ByVal leadSheet As Worksheet, _
+    ByVal leadHeaders As Variant, _
+    ByVal leadFirstColumn As Long, _
+    ByVal idIndex As Collection, _
+    ByRef repairedCount As Long, _
+    ByRef unmatchedRepairs As Long _
+)
+    Dim block As Long
+    Dim idColumn As Long
+    Dim testedColumn As Long
+    Dim cableId As String
+    Dim testedText As String
+    Dim targetRow As Long
+
+    For block = 1 To MAX_REPAIR_BLOCKS
+        idColumn = HeaderColumn(respHeaders, block & ". Repair Lead Cable ID")
+
+        If idColumn > 0 Then
+            cableId = Trim$(CStr(SafeValue(respValues, rowIndex, idColumn)))
+
+            If Len(cableId) > 0 Then
+                testedColumn = HeaderColumn(respHeaders, _
+                    block & ". Have you tested with the logger (Repair)?")
+                testedText = LCase$(Trim$(CStr( _
+                    SafeValue(respValues, rowIndex, testedColumn))))
+
+                targetRow = IndexedRow(idIndex, cableId)
+                If targetRow > 0 Then
+                    SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                        leadHeaders, "Tested Date", _
+                        ResponseDate(respValues, rowIndex, respHeaders)
+                    If testedText = "yes" Then
+                        SetLeadCell leadSheet, targetRow, leadFirstColumn, _
+                            leadHeaders, "Condition", TESTED_CONDITION
+                    End If
+                    repairedCount = repairedCount + 1
+                Else
+                    unmatchedRepairs = unmatchedRepairs + 1
+                End If
+            End If
+        End If
+    Next block
+End Sub
+
+' SL... cables are OS2, L... cables are OM3 - the rule every existing
+' row on the Lead Cables tab follows.
+Private Function LeadTypeFromId(ByVal cableId As String) As String
+    Dim normalised As String
+
+    normalised = UCase$(Trim$(cableId))
+    If Left$(normalised, 2) = "SL" Then
+        LeadTypeFromId = "OS2"
+    ElseIf Left$(normalised, 1) = "L" Then
+        LeadTypeFromId = "OM3"
+    End If
+End Function
+
+' Submission date, taken from Completion time, falling back to Start
+' time. Time of day is dropped - the tab records dates.
+Private Function ResponseDate( _
+    ByVal respValues As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal respHeaders As Variant _
+) As Variant
+    Dim col As Long
+    Dim raw As Variant
+
+    col = HeaderColumn(respHeaders, "Completion time")
+    If col = 0 Then col = HeaderColumn(respHeaders, "Start time")
+    If col = 0 Then Exit Function
+
+    raw = SafeValue(respValues, rowIndex, col)
+    If IsDate(raw) Then ResponseDate = CDate(Int(CDbl(CDate(raw))))
+End Function
+
+Private Function ResponseInitials( _
+    ByVal respValues As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal respHeaders As Variant _
+) As Variant
+    Dim col As Long
+
+    col = HeaderColumn(respHeaders, "Name / Initials")
+    If col = 0 Then Exit Function
+    ResponseInitials = SafeValue(respValues, rowIndex, col)
+End Function
+
+Private Function SafeValue( _
+    ByVal values As Variant, _
+    ByVal rowIndex As Long, _
+    ByVal columnIndex As Long _
+) As Variant
+    If columnIndex < 1 Then Exit Function
+    If columnIndex > UBound(values, 2) Then Exit Function
+    If IsError(values(rowIndex, columnIndex)) Then Exit Function
+    SafeValue = values(rowIndex, columnIndex)
+End Function
+
+Private Function IndexedRow( _
+    ByVal idIndex As Collection, _
+    ByVal cableId As String _
+) As Long
+    On Error Resume Next
+    IndexedRow = idIndex.Item(CompactKey(cableId))
+    On Error GoTo 0
+End Function
+
+Private Sub SetLeadCell( _
+    ByVal leadSheet As Worksheet, _
+    ByVal rowNumber As Long, _
+    ByVal firstColumn As Long, _
+    ByVal leadHeaders As Variant, _
+    ByVal headerText As String, _
+    ByVal newValue As Variant _
+)
+    Dim col As Long
+
+    If IsEmpty(newValue) Then Exit Sub
+    If VarType(newValue) = vbString Then
+        If Len(Trim$(CStr(newValue))) = 0 Then Exit Sub
+    End If
+
+    col = HeaderColumn(leadHeaders, headerText)
+    If col = 0 Then Exit Sub
+
+    leadSheet.Cells(rowNumber, firstColumn + col - 1).value = newValue
+End Sub
+
+Private Sub SetLeadCellIfBlank( _
+    ByVal leadSheet As Worksheet, _
+    ByVal rowNumber As Long, _
+    ByVal firstColumn As Long, _
+    ByVal leadHeaders As Variant, _
+    ByVal headerText As String, _
+    ByVal newValue As Variant _
+)
+    Dim col As Long
+    Dim target As Range
+
+    col = HeaderColumn(leadHeaders, headerText)
+    If col = 0 Then Exit Sub
+
+    Set target = leadSheet.Cells(rowNumber, firstColumn + col - 1)
+    If Len(Trim$(CStr(target.value))) > 0 Then Exit Sub
+
+    SetLeadCell leadSheet, rowNumber, firstColumn, leadHeaders, _
+        headerText, newValue
+End Sub
+
+Private Sub PutLeadValue( _
+    ByRef rowValues As Variant, _
+    ByVal leadHeaders As Variant, _
+    ByVal headerText As String, _
+    ByVal newValue As Variant _
+)
+    Dim col As Long
+
+    col = HeaderColumn(leadHeaders, headerText)
+    If col = 0 Then Exit Sub
+    rowValues(col) = newValue
+End Sub
+
+' Adds one row at the end of the Lead Cables tab, growing the table
+' when the tab holds one, and returns the row written.
+Private Function AppendLeadRow( _
+    ByVal leadSheet As Worksheet, _
+    ByVal rowValues As Variant, _
+    ByVal columnCount As Long _
+) As Long
+    Dim leadTable As ListObject
+    Dim headerRange As Range
+    Dim dataRange As Range
+    Dim firstColumn As Long
+    Dim writeRow As Long
+
+    GetSheetLayout leadSheet, leadTable, headerRange, dataRange
+    firstColumn = headerRange.Column
+
+    If dataRange Is Nothing Then
+        writeRow = headerRange.Row + 1
+    ElseIf dataRange.Rows.Count = 1 And IsBlankRange(dataRange) Then
+        writeRow = dataRange.Row
+    Else
+        writeRow = dataRange.Row + dataRange.Rows.Count
+    End If
+
+    leadSheet.Cells(writeRow, firstColumn).Resize(1, columnCount).value = _
+        rowValues
+
+    If Not leadTable Is Nothing Then
+        leadTable.Resize leadSheet.Range( _
+            headerRange.Cells(1, 1), _
+            leadSheet.Cells(writeRow, firstColumn + columnCount - 1))
+    End If
+
+    AppendLeadRow = writeRow
+End Function
+
+' Header lookup that ignores case, spaces and punctuation, so
+' "1. Have you tested with the logger (prep)? " still matches.
+Private Function HeaderColumn( _
+    ByVal headers As Variant, _
+    ByVal wantedText As String _
+) As Long
+    Dim target As String
+    Dim col As Long
+
+    target = CompactKey(wantedText)
+    If Len(target) = 0 Then Exit Function
+
+    For col = 1 To UBound(headers)
+        If CompactKey(CStr(headers(col))) = target Then
+            HeaderColumn = col
+            Exit Function
+        End If
+    Next col
+End Function
+
+Private Function CompactKey(ByVal text As String) As String
+    Dim lowered As String
+    Dim character As String
+    Dim result As String
+    Dim position As Long
+
+    lowered = LCase$(Trim$(text))
+    For position = 1 To Len(lowered)
+        character = Mid$(lowered, position, 1)
+        If character Like "[a-z0-9]" Then result = result & character
+    Next position
+
+    CompactKey = result
+End Function
+
+' ---------------------------------------------------------------
 
 ' Header and data ranges of a sheet. When the sheet holds an Excel
 ' Table the table defines them, so structured-reference formulas and
