@@ -120,20 +120,38 @@ Public Sub PrintPileRecord()
     pileId = Trim$(CStr(recordSheet.Range("B8").Value))
     If Len(pileId) = 0 Then pileId = recordSheet.Name
 
-    ' Ask for the save location.
+    ' Ask for the save location. A workbook opened from SharePoint
+    ' reports an https:// address as its path - a web location, not a
+    ' folder - so it is only offered as a starting point when it is a
+    ' real path on this computer.
     With Application.FileDialog(msoFileDialogFolderPicker)
         .Title = "Choose where to save " & pileId & FILE_SUFFIX
-        If Len(ThisWorkbook.Path) > 0 Then
+        If IsLocalPath(ThisWorkbook.Path) Then
             .InitialFileName = ThisWorkbook.Path & Application.PathSeparator
         End If
         If .Show = 0 Then Exit Sub  ' user cancelled
         folderPath = .SelectedItems(1)
     End With
 
+    Do While Len(folderPath) > 1 And _
+             Right$(folderPath, 1) = Application.PathSeparator
+        folderPath = Left$(folderPath, Len(folderPath) - 1)
+    Loop
+
+    If Not IsLocalPath(folderPath) Then
+        MsgBox "The picture can only be saved to a folder on this " & _
+               "computer, and this is a web address:" & vbCrLf & _
+               folderPath & vbCrLf & vbCrLf & _
+               "Choose a local folder instead - a OneDrive folder that " & _
+               "syncs to this PC is fine.", _
+               vbExclamation, "Print pile record"
+        Exit Sub
+    End If
+
     filePath = folderPath & Application.PathSeparator & _
                SafeFileName(pileId) & FILE_SUFFIX
 
-    If Len(Dir$(filePath)) > 0 Then
+    If FileExists(filePath) Then
         If MsgBox(filePath & vbCrLf & vbCrLf & _
                   "This file already exists. Overwrite it?", _
                   vbYesNo + vbQuestion, "Print pile record") = vbNo Then
@@ -240,17 +258,56 @@ CleanFail:
     Err.Raise vbObjectError + 514, "SaveClipboardBitmapAsJpeg", failureText
 End Sub
 
-' Windows filenames reject \ / : * ? " < > |
+' Windows filenames reject \ / : * ? " < > | and control characters,
+' and may not end with a space or a dot. A pile ID carrying a line
+' break is the usual hidden cause of "Bad file name or number".
 Private Function SafeFileName(ByVal proposedName As String) As String
-    Dim cleaned As String
-    Dim badChars As Variant
-    Dim i As Long
+    Dim character As String
+    Dim result As String
+    Dim position As Long
 
-    cleaned = proposedName
-    badChars = Array("\", "/", ":", "*", "?", """", "<", ">", "|")
-    For i = LBound(badChars) To UBound(badChars)
-        cleaned = Replace$(cleaned, badChars(i), "-")
-    Next i
+    For position = 1 To Len(proposedName)
+        character = Mid$(proposedName, position, 1)
+        If InStr(1, "\/:*?""<>|", character) > 0 Then
+            result = result & "-"
+        ElseIf AscW(character) < 32 Then
+            result = result & " "
+        Else
+            result = result & character
+        End If
+    Next position
 
-    SafeFileName = cleaned
+    result = Trim$(result)
+    Do While Len(result) > 0 And Right$(result, 1) = "."
+        result = Trim$(Left$(result, Len(result) - 1))
+    Loop
+
+    If Len(result) = 0 Then result = "Pile"
+    SafeFileName = result
+End Function
+
+' True for a path this machine can write to. A workbook opened
+' straight from SharePoint reports an https:// path, which is a web
+' address rather than a folder.
+Private Function IsLocalPath(ByVal candidate As String) As Boolean
+    Dim normalised As String
+
+    normalised = LCase$(Trim$(candidate))
+    If Len(normalised) = 0 Then Exit Function
+    If Left$(normalised, 7) = "http://" Then Exit Function
+    If Left$(normalised, 8) = "https://" Then Exit Function
+
+    IsLocalPath = True
+End Function
+
+' Dir$ raises "Bad file name or number" on a path it cannot parse, so
+' the existence check never reaches the caller as a crash.
+Private Function FileExists(ByVal fullPath As String) As Boolean
+    Dim found As String
+
+    On Error Resume Next
+    found = Dir$(fullPath)
+    On Error GoTo 0
+
+    FileExists = (Len(found) > 0)
 End Function
