@@ -1512,17 +1512,27 @@ Private Function ValidationListName(ByVal category As String) As String
     End Select
 End Function
 
+' Reads E11 whatever arrow or dash style it was typed with. Only the
+' letters are compared, so "Office -> Site", "Office - Site", an en/em
+' dash, or a character mangled by a copy/paste round trip all resolve
+' the same way. Matching literal arrow characters here used to break
+' the module every time the code was pasted between machines.
 Private Function NormalisedDirection(ByVal rawValue As Variant) As String
     Dim value As String
-    value = LCase$(Trim$(CStr(rawValue)))
-    value = Replace(value, "‰ Õ", "->")
-    value = Replace(value, "‰ÛÒ", "-")
-    value = Replace(value, "‰ÛÓ", "-")
-    value = Replace(value, " ", vbNullString)
+    Dim letters As String
+    Dim character As String
+    Dim position As Long
 
-    If value = "office->site" Then
+    value = LCase$(Trim$(CStr(rawValue)))
+
+    For position = 1 To Len(value)
+        character = Mid$(value, position, 1)
+        If character Like "[a-z]" Then letters = letters & character
+    Next position
+
+    If letters = "officesite" Then
         NormalisedDirection = "office -> site"
-    ElseIf value = "site->office" Then
+    ElseIf letters = "siteoffice" Then
         NormalisedDirection = "site -> office"
     Else
         NormalisedDirection = value
