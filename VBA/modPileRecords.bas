@@ -51,8 +51,19 @@ Public Sub CreatePileRecords()
     Application.ScreenUpdating = False
     Application.EnableEvents = False
 
-    Set scheduleSheet = ThisWorkbook.Worksheets(SCHEDULE_SHEET)
-    Set templateSheet = ThisWorkbook.Worksheets(RECORD_TEMPLATE_SHEET)
+    ' Resolved one at a time, tolerating case and stray spaces in the
+    ' tab names, so a missing sheet reports which one it was instead of
+    ' a bare "subscript out of range".
+    Set scheduleSheet = FindSheet(SCHEDULE_SHEET)
+    Set templateSheet = FindSheet(RECORD_TEMPLATE_SHEET)
+
+    If scheduleSheet Is Nothing Or templateSheet Is Nothing Then
+        Application.EnableEvents = previousEnableEvents
+        Application.ScreenUpdating = previousScreenUpdating
+        MsgBox MissingSheetMessage(scheduleSheet, templateSheet), _
+               vbExclamation, "Pile records"
+        Exit Sub
+    End If
 
     lastRow = scheduleSheet.Cells(scheduleSheet.Rows.Count, COL_PILE_ID) _
         .End(xlUp).Row
@@ -110,6 +121,54 @@ CleanFail:
     MsgBox "Could not create the pile record sheets." & vbCrLf & vbCrLf & _
            errorMessage, vbExclamation, "Pile records"
 End Sub
+
+' Sheet lookup that ignores capitalisation and stray spaces in tab
+' names, so "schedule" or "Record_Template " still resolve.
+Private Function FindSheet(ByVal wantedName As String) As Worksheet
+    Dim candidate As Worksheet
+
+    For Each candidate In ThisWorkbook.Worksheets
+        If LCase$(Trim$(candidate.Name)) = LCase$(Trim$(wantedName)) Then
+            Set FindSheet = candidate
+            Exit Function
+        End If
+    Next candidate
+End Function
+
+' Names the sheet that is missing and lists what this workbook does
+' contain - the usual cause is the module sitting in the wrong
+' workbook, since Schedule and Record_Template live in the Project Mob
+' List file.
+Private Function MissingSheetMessage( _
+    ByVal scheduleSheet As Worksheet, _
+    ByVal templateSheet As Worksheet _
+) As String
+    Dim missingNames As String
+    Dim candidate As Worksheet
+    Dim sheetList As String
+
+    If scheduleSheet Is Nothing Then
+        missingNames = """" & SCHEDULE_SHEET & """"
+    End If
+    If templateSheet Is Nothing Then
+        If Len(missingNames) > 0 Then missingNames = missingNames & " and "
+        missingNames = missingNames & """" & RECORD_TEMPLATE_SHEET & """"
+    End If
+
+    For Each candidate In ThisWorkbook.Worksheets
+        If Len(sheetList) > 0 Then sheetList = sheetList & ", "
+        sheetList = sheetList & candidate.Name
+    Next candidate
+
+    MissingSheetMessage = _
+        ThisWorkbook.Name & " has no sheet called " & missingNames & "." & _
+        vbCrLf & vbCrLf & _
+        "Sheets in this workbook: " & sheetList & vbCrLf & vbCrLf & _
+        "This macro belongs in the Project Mob List workbook - the one " & _
+        "holding the Schedule and Record_Template tabs. If it was " & _
+        "imported into another workbook (or into PERSONAL.XLSB), move " & _
+        "it to that project, or rename the tabs to match."
+End Function
 
 ' Excel sheet names are capped at 31 characters and reject : \ / ? * [ ]
 Private Function SafeSheetName(ByVal proposedName As String) As String
